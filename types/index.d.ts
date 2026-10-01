@@ -1,5 +1,9 @@
 export type Git = { branch: string; dirty: number; ahead: number; behind: number; hasUpstream: boolean }
 
+// Whether a session is worth re-caching: unfinished work (active), finished but substantial
+// (reference: save a handoff and close), or quick questions (light: close).
+export type ResumeValue = 'active' | 'reference' | 'light'
+
 export type Row = {
   key: string
   // Claude Code's name for the session; `isNamed` when the person chose it (then it beats `title`).
@@ -7,6 +11,7 @@ export type Row = {
   isNamed: boolean
   // A short topic written by Haiku from the conversation, once fleet has made one.
   title: string | null
+  value: ResumeValue | null
   status: string
   cwd: string
   pid: number | null

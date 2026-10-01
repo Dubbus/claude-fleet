@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Git, Row, Snapshot } from '../types'
+import type { Git, ResumeValue, Row, Snapshot } from '../types'
 
 const PANE = 'fleet'
 const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
@@ -25,6 +25,9 @@ const EXPORT_MAX_BYTES = 80 * 1024 * 1024
 const HEAD_BYTES = 300_000
 const TITLES_KEY = 'titles'
 const TITLES_PER_SCAN = 2
+// Handoffs summarize at most this much of a transcript (head kept for the goal, the rest from the end).
+const HANDOFF_INPUT_CHARS = 400_000
+const HANDOFF_HEAD_CHARS = 60_000
 // A second press of x within this window closes the selected session.
 const CLOSE_CONFIRM_MS = 10_000
 
@@ -34,7 +37,7 @@ const REGISTRY_DIR = '.claude/sessions'
 const PROJECTS_DIR = '.claude/projects'
 
 type Registered = { pid: number; name: string; isNamed: boolean; status: string; cwd: string; sessionId: string; updatedAt: number }
-type TitleEntry = { title: string; size: number }
+type TitleEntry = { title: string; size: number; value?: ResumeValue }
 type Armed = { args: string; pids: number[]; at: number }
 
 const basename = (path: string) => path.split('/').filter(Boolean).pop() ?? path
@@ -54,6 +57,17 @@ const fit = (text: string, width: number) =>
   text.length > width ? `${text.slice(0, Math.max(0, width - 1))}…` : text.padEnd(width)
 
 const label = (row: Row) => (row.isNamed ? row.name : row.title ?? row.name)
+
+const VALUE_GLYPH: Record<ResumeValue, string> = { active: '●', reference: '◐', light: '○' }
+const VALUE_COLOR: Record<ResumeValue, string | undefined> = { active: 'green', reference: 'yellow', light: undefined }
+const VALUE_WORD: Record<ResumeValue, string> = { active: 'in progress', reference: 'finished', light: 'light' }
+
+const glyph = (row: Row) => (row.value ? VALUE_GLYPH[row.value] : ' ')
+
+// Safe to close: idle, and either cold with nothing unfinished, or idle for a week and not known to be in progress.
+const isClosable = (row: Row, now: number) =>
+  row.pid !== null && !row.isSelf && row.status === 'idle' &&
+  ((isCold(row, now) && (row.value === 'light' || row.value === 'reference')) || (isStale(row, now) && row.value !== 'active'))
 
 // The same conversation resumed in two terminals shows up as two processes with one sessionId.
 const windowCounts = (rows: Row[]) => {
@@ -195,6 +209,7 @@ const scan = async ($: EngineInterface, isFull: boolean) => {
     name: s.name,
     isNamed: s.isNamed,
     title: titles[s.sessionId]?.title ?? null,
+    value: titles[s.sessionId]?.value ?? null,
     status: s.status,
     cwd: s.cwd,
     pid: s.pid,
@@ -209,7 +224,7 @@ const scan = async ($: EngineInterface, isFull: boolean) => {
     const taken = new Set(rows.map(r => r.cwd))
     for (const path of await idleWorktrees($, taken)) {
       rows.push({
-        key: `wt:${path}`, name: '(no session)', isNamed: true, title: null, status: 'worktree', cwd: path,
+        key: `wt:${path}`, name: '(no session)', isNamed: true, title: null, value: null, status: 'worktree', cwd: path,
         pid: null, sessionId: '', updatedAt: 0, isSelf: false, git: null, tokens: null,
       })
     }
@@ -260,11 +275,13 @@ const summary = (snap: Snapshot) => {
   const busy = live.filter(r => r.status === 'busy').length
   const cold = live.filter(r => !r.isSelf && isCold(r, snap.scannedAt)).reduce((sum, r) => sum + (r.tokens ?? 0), 0)
   const twice = [...windowCounts(live).values()].filter(n => n > 1).length
+  const closable = live.filter(r => isClosable(r, snap.scannedAt)).length
   return (
     `${live.length} sessions · ${busy} busy` +
     (stale ? ` · ${stale} idle > 7d` : '') +
     (twice ? ` · ${twice} open in ${twice === 1 ? 'two windows' : 'several windows'}` : '') +
-    (cold ? ` · ${tokensText(cold)} tokens to re-cache` : '')
+    (cold ? ` · ${tokensText(cold)} tokens to re-cache` : '') +
+    (closable ? ` · ${closable} safe to close` : '')
   )
 }
 
@@ -280,6 +297,7 @@ const ctxText = (row: Row, now: number) =>
 const tableLine = (r: Row, now: number, hasGit = true, counts = new Map<string, number>()) =>
   [
     r.isSelf ? '▸' : ' ',
+    glyph(r),
     fitLabel(r, counts, 34),
     fit(r.status, 9),
     fit(basename(r.cwd), 22),
@@ -297,7 +315,8 @@ const asTable = (snap: Snapshot) => {
     `ctx = context the session re-caches on its next message; "cold" = cache expired, so that costs the full amount.` +
     (counts.size && [...counts.values()].some(n => n > 1)
       ? `\n×2 = the same conversation open in two terminals; closing the older one loses nothing.`
-      : '')
+      : '') +
+    `\n● in progress: worth resuming   ◐ finished: /fleet handoff, then close   ○ light: just close`
   )
 }
 
@@ -381,24 +400,75 @@ const toMarkdown = (row: Row, jsonl: string, exportedAt: string) => {
   return out.join('\n')
 }
 
-const saveSession = async ($: EngineInterface, row: Row): Promise<string> => {
+const readTranscript = async ($: EngineInterface, row: Row) => {
   const home = await $.env.get('HOME')
   if (!home || !row.sessionId) throw new Error('no transcript for this session')
   const source = transcriptPath(home, row)
   if (!(await $.fs.exists(source))) throw new Error('transcript not found')
   if ((await $.fs.stat(source)).size > EXPORT_MAX_BYTES) throw new Error('transcript is over 80 MB')
+  return String(await $.fs.read(source))
+}
 
-  const now = new Date(await $.clock.now())
+// `<folder>/<prefix>-<title>-<date>.md`, numbered when that name is taken.
+const freshPath = async ($: EngineInterface, row: Row, prefix: string, now: Date) => {
   const slug = label(row).replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 60)
-  const stem = `${row.cwd}/claude-context-${slug}-${now.toISOString().slice(0, 10)}`
+  const stem = `${row.cwd}/${prefix}-${slug}-${now.toISOString().slice(0, 10)}`
   let target = `${stem}.md`
   for (let n = 2; await $.fs.exists(target); n++) target = `${stem}-${n}.md`
+  return target
+}
 
-  await $.fs.write(target, toMarkdown(row, String(await $.fs.read(source)), now.toISOString()))
-
-  // Conversations can hold secrets; say so when the file would show up in `git status`.
+// Conversations can hold secrets; say so when the file would show up in `git status`.
+const withGitNote = async ($: EngineInterface, row: Row, target: string) => {
   const ignored = await $.process.run(['git', '-C', row.cwd, 'check-ignore', '-q', target], { timeoutMs: 3000 })
   return ignored.exitCode === 1 ? `${target}  (not git-ignored: check it before committing)` : target
+}
+
+const saveSession = async ($: EngineInterface, row: Row): Promise<string> => {
+  const jsonl = await readTranscript($, row)
+  const now = new Date(await $.clock.now())
+  const target = await freshPath($, row, 'claude-context', now)
+  await $.fs.write(target, toMarkdown(row, jsonl, now.toISOString()))
+  return withGitNote($, row, target)
+}
+
+const HANDOFF_SYSTEM = `You write handoff notes so a fresh Claude Code session can continue someone's work without the old transcript.
+From the transcript only, write Markdown with these sections, skipping any that would be empty:
+## Goal: what the person is trying to get done, in 1-3 sentences.
+## Status: what is done, and what was in progress when the transcript ends.
+## Decisions: choices made and WHY, including approaches tried and rejected.
+## Next steps: concrete open threads, in order.
+## Key files and commands: paths, commands and URLs that matter, as a short list.
+## Gotchas: preferences the person stated, constraints, and things that broke.
+Be specific and factual: names, paths and numbers over generalities. Never invent. At most 700 words.`
+
+const handoffSession = async ($: EngineInterface, row: Row): Promise<string> => {
+  const now = new Date(await $.clock.now())
+  let text = toMarkdown(row, await readTranscript($, row), now.toISOString())
+  if (text.length > HANDOFF_INPUT_CHARS) {
+    text =
+      text.slice(0, HANDOFF_HEAD_CHARS) +
+      '\n\n[… middle of the conversation omitted …]\n\n' +
+      text.slice(-(HANDOFF_INPUT_CHARS - HANDOFF_HEAD_CHARS))
+  }
+
+  const r = await $.model.complete({ model: 'sonnet', system: HANDOFF_SYSTEM, prompt: text, maxTokens: 3000 })
+  if (!r.isAnswered) throw new Error(`the summary call failed (${r.reason})`)
+
+  const target = await freshPath($, row, 'claude-handoff', now)
+  const doc = [
+    `# Handoff: ${label(row)}`,
+    '',
+    `Written ${now.toISOString().slice(0, 16).replace('T', ' ')} from session \`${row.sessionId}\` in \`${row.cwd}\`.`,
+    '',
+    `To continue in a fresh session: run \`claude\` in this folder and say "Read ${basename(target)} and pick up where it leaves off."`,
+    `The full conversation is still there: \`claude --resume ${row.sessionId}\`.`,
+    '',
+    r.text.trim(),
+    '',
+  ].join('\n')
+  await $.fs.write(target, doc)
+  return withGitNote($, row, target)
 }
 
 const findRow = (snap: Snapshot, query: string) =>
@@ -410,7 +480,7 @@ const findRow = (snap: Snapshot, query: string) =>
 // --- Closing sessions ---
 
 const killTargets = (snap: Snapshot, isAll: boolean) =>
-  snap.rows.filter(r => r.pid !== null && !r.isSelf && r.status === 'idle' && (isAll || isStale(r, snap.scannedAt)))
+  snap.rows.filter(r => (isAll ? r.pid !== null && !r.isSelf && r.status === 'idle' : isClosable(r, snap.scannedAt)))
 
 // Pids get reused: only signal a pid that is still a Claude process.
 const isClaudeProcess = async ($: EngineInterface, pid: number) => {
@@ -422,10 +492,13 @@ const runKill = async ($: EngineInterface, args: string, armed: Armed | null): P
   const words = args.split(/\s+/).filter(Boolean)
   const isAll = words.includes('all')
   const isSave = words.includes('--save')
-  const key = `${isAll ? 'all' : 'stale'}${isSave ? ' --save' : ''}`
+  const isHandoff = words.includes('--handoff')
+  const key = `${isAll ? 'all' : 'closable'}${isSave ? ' --save' : ''}${isHandoff ? ' --handoff' : ''}`
   const snap = await scan($, true)
   const targets = killTargets(snap, isAll)
-  const scope = isAll ? 'idle sessions' : 'sessions idle for more than 7 days'
+  const scope = isAll
+    ? 'idle sessions'
+    : 'sessions safe to close (cold and finished or light, or idle over a week and not in progress)'
 
   if (targets.length === 0) return [`No ${scope} to close (busy sessions, ones waiting on you, and this one are never closed).`, null]
 
@@ -438,7 +511,11 @@ const runKill = async ($: EngineInterface, args: string, armed: Armed | null): P
     return [
       `This would close ${targets.length} ${scope}` + (tokens ? ` (${tokensText(tokens)} tokens of context):` : ':') + '\n\n' +
         targets.map(r => `  ${String(r.pid).padStart(6)}  ${tableLine(r, snap.scannedAt, true, windowCounts(snap.rows))}`).join('\n') + '\n\n' +
-        (isSave ? 'Each conversation is saved as Markdown in its folder first.\n' : 'Add --save to export each conversation as Markdown first.\n') +
+        (isHandoff
+          ? 'A handoff summary is written in each folder first (a Sonnet call per session).\n'
+          : isSave
+            ? 'Each conversation is saved as Markdown in its folder first.\n'
+            : 'Add --handoff to write a summary first, or --save for the full conversation.\n') +
         `Run /fleet kill${args ? ` ${args}` : ''} again within 60s to confirm. Conversations stay resumable with claude --resume.`,
       { args: key, pids: targets.map(t => t.pid!), at: snap.scannedAt },
     ]
@@ -450,16 +527,15 @@ const runKill = async ($: EngineInterface, args: string, armed: Armed | null): P
       lines.push(`  skipped ${row.pid} ${row.name}: no longer a Claude process`)
       continue
     }
-    if (isSave) {
-      try {
-        lines.push(`  saved   ${row.name} → ${await saveSession($, row)}`)
-      } catch (err) {
-        lines.push(`  kept    ${row.pid} ${row.name}: save failed (${(err as Error).message}), so not closed`)
-        continue
-      }
+    try {
+      if (isSave) lines.push(`  saved   ${label(row)} → ${await saveSession($, row)}`)
+      if (isHandoff) lines.push(`  handoff ${label(row)} → ${await handoffSession($, row)}`)
+    } catch (err) {
+      lines.push(`  kept    ${row.pid} ${label(row)}: ${(err as Error).message}, so not closed`)
+      continue
     }
     const r = await $.process.run(['kill', String(row.pid)], { timeoutMs: 3000 })
-    lines.push(r.exitCode === 0 ? `  closed  ${row.pid} ${row.name}` : `  failed  ${row.pid} ${row.name}: ${r.stderr.trim()}`)
+    lines.push(r.exitCode === 0 ? `  closed  ${row.pid} ${label(row)}` : `  failed  ${row.pid} ${label(row)}: ${r.stderr.trim()}`)
   }
   void scan($, true)
   return [lines.join('\n'), null]
@@ -486,13 +562,29 @@ const userPrompts = (jsonl: string) => {
   return prompts
 }
 
+const lastAssistantText = (jsonl: string) => {
+  const lines = jsonl.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes('"assistant"')) continue
+    try {
+      const entry = JSON.parse(lines[i])
+      if (entry.type !== 'assistant' || entry.isSidechain) continue
+      const text = textOf(entry.message?.content).trim()
+      if (text) return text
+    } catch {
+      // Cut mid-entry.
+    }
+  }
+  return ''
+}
+
 const cleanTitle = (text: string) =>
   text.split('\n')[0].replace(/^(title:\s*)/i, '').replace(/["'`*#]/g, '').replace(/[.\s]+$/, '').trim().slice(0, 48)
 
 // In flight across scans, so a slow call isn't started twice.
 const titling = new Set<string>()
 
-const makeTitle = async ($: EngineInterface, path: string) => {
+const makeTitle = async ($: EngineInterface, path: string, idleText: string) => {
   const [head, tail] = await Promise.all([
     $.process.run(['head', '-c', String(HEAD_BYTES), path], { timeoutMs: 3000 }),
     $.process.run(['tail', '-c', String(TAIL_BYTES), path], { timeoutMs: 3000 }),
@@ -500,22 +592,43 @@ const makeTitle = async ($: EngineInterface, path: string) => {
   const first = userPrompts(head.stdout).slice(0, 3)
   const latest = userPrompts(tail.stdout).slice(-2).filter(p => !first.includes(p))
   if (first.length === 0) return null
+  const lastReply = lastAssistantText(tail.stdout).slice(-800)
 
   const r = await $.model.complete({
     model: 'haiku',
     system:
-      'You name coding sessions for a session list. Reply with a 3-6 word title naming the task, nothing else: ' +
-      'no quotes, no trailing punctuation, and never the words "session", "conversation" or "chat". ' +
-      'Lead with the concrete project and goal ("Canvas lab 2 grading drafts").',
-    prompt: `Opening requests:\n${first.join('\n---\n')}\n\nLatest requests:\n${latest.join('\n---\n') || '(same)'}`.slice(0, 4000),
-    maxTokens: 30,
+      'You label coding sessions for a session list. Reply with JSON only: {"title": string, "value": string}.\n' +
+      'title: 3-6 words naming the task, leading with the concrete project and goal ("Canvas lab 2 grading drafts"); ' +
+      'no quotes, no trailing punctuation, never the words "session", "conversation" or "chat".\n' +
+      'value: whether resuming is worth re-sending the whole conversation. Pick exactly one:\n' +
+      '- "light": quick questions or one-off lookups; nothing a fresh session couldn\'t redo in a minute.\n' +
+      '- "reference": substantial work whose main task was delivered or answered. This is the DEFAULT for real work. ' +
+      'A last reply that offers more help, lists optional next steps, or asks "want me to...?" is still "reference".\n' +
+      '- "active": ONLY when work is clearly mid-flight: the last reply stops partway through an implementation, ' +
+      'a bug or failing test is still being chased, or the person must answer a question before anything can continue. ' +
+      'Sessions idle for weeks are rarely active.',
+    prompt: (
+      `Opening requests:\n${first.join('\n---\n')}\n\nLatest requests:\n${latest.join('\n---\n') || '(same)'}` +
+      `\n\nLast reply (end):\n${lastReply || '(none)'}\n\nIdle for: ${idleText}`
+    ).slice(0, 5000),
+    maxTokens: 80,
     effort: 'low',
   })
-  return r.isAnswered ? cleanTitle(r.text) || null : null
+  if (!r.isAnswered) return null
+  try {
+    const raw = JSON.parse(r.text.slice(r.text.indexOf('{'), r.text.lastIndexOf('}') + 1))
+    const title = cleanTitle(String(raw.title ?? ''))
+    const value = ['active', 'reference', 'light'].includes(raw.value) ? (raw.value as ResumeValue) : undefined
+    return title ? { title, value } : null
+  } catch {
+    const title = cleanTitle(r.text)
+    return title && !title.includes('{') ? { title, value: undefined } : null
+  }
 }
 
 // Titles a few untitled sessions per scan, and retitles one whose transcript has doubled.
 const refreshTitles = async ($: EngineInterface, home: string, rows: Row[], titles: Record<string, TitleEntry>, limit = TITLES_PER_SCAN) => {
+  const now = await $.clock.now()
   const due: { row: Row; path: string; size: number }[] = []
   for (const row of rows) {
     if (!row.sessionId || row.isNamed || titling.has(row.sessionId)) continue
@@ -523,15 +636,15 @@ const refreshTitles = async ($: EngineInterface, home: string, rows: Row[], titl
     if (!(await $.fs.exists(path))) continue
     const { size } = await $.fs.stat(path)
     const known = titles[row.sessionId]
-    if (!known || size > known.size * 2) due.push({ row, path, size })
+    if (!known || !known.value || size > known.size * 2) due.push({ row, path, size })
     if (due.length >= limit) break
   }
 
   for (const { row } of due) titling.add(row.sessionId)
   const made = await Promise.all(
     due.map(({ row, path, size }) =>
-      makeTitle($, path)
-        .then(title => (title ? { sessionId: row.sessionId, title, size } : null))
+      makeTitle($, path, ago(now - row.updatedAt).replace('now', 'under a minute'))
+        .then(made => (made ? { sessionId: row.sessionId, ...made, size } : null))
         .catch(() => null),
     ),
   )
@@ -540,11 +653,17 @@ const refreshTitles = async ($: EngineInterface, home: string, rows: Row[], titl
   const fresh = made.filter(m => m !== null)
   if (fresh.length === 0) return 0
   const all = await readTitles($)
-  for (const m of fresh) all[m.sessionId] = { title: m.title, size: m.size }
+  for (const m of fresh) all[m.sessionId] = { title: m.title, size: m.size, value: m.value }
   await $.store.set(TITLES_KEY, all)
-  const byId = new Map(fresh.map(m => [m.sessionId, m.title]))
+  const byId = new Map(fresh.map(m => [m.sessionId, m]))
   await update($, snapshot, snap =>
-    snap && { ...snap, rows: snap.rows.map(r => (byId.has(r.sessionId) ? { ...r, title: byId.get(r.sessionId)! } : r)) },
+    snap && {
+      ...snap,
+      rows: snap.rows.map(r => {
+        const m = byId.get(r.sessionId)
+        return m ? { ...r, title: m.title, value: m.value ?? null } : r
+      }),
+    },
   )
   return fresh.length
 }
@@ -578,6 +697,17 @@ const saveSelected = async ($: EngineInterface) => {
   }
 }
 
+const handoffSelected = async ($: EngineInterface) => {
+  const row = await selectedRow($)
+  if (!row || row.pid === null) return $.ui.toast('Select a session first (↑/↓)')
+  $.ui.toast(`Writing a handoff for ${label(row)}…`)
+  try {
+    $.ui.toast(`Handoff → ${await handoffSession($, row)}`)
+  } catch (err) {
+    $.ui.toast(`Couldn't write a handoff: ${(err as Error).message}`)
+  }
+}
+
 const closeSelected = async ($: EngineInterface) => {
   const row = await selectedRow($)
   if (!row || row.pid === null) return $.ui.toast('Select a session first (↑/↓)')
@@ -589,7 +719,7 @@ const closeSelected = async ($: EngineInterface) => {
     $.clock.after(CLOSE_CONFIRM_MS, () => {
       void update($, pendingClose, key => (key === row.key ? null : key))
     })
-    return $.ui.toast(`Press x again to close ${label(row)} (s saves it first)`)
+    return $.ui.toast(`Press x again to close ${label(row)} (h writes a handoff first)`)
   }
 
   await update($, pendingClose, () => null)
@@ -608,12 +738,15 @@ const openPane = async ($: EngineInterface) => {
 const HELP = `/fleet                 open the live pane
 /fleet list            print the table
 /fleet stale           sessions idle for more than 7 days
-/fleet save [pid|name] export a conversation as Markdown in its folder (default: this one)
-/fleet kill [--save]   close stale sessions (asks you to repeat it to confirm)
-/fleet kill all [--save]  close every idle session except this one
+/fleet save [pid|name]    export a whole conversation as Markdown in its folder (default: this one)
+/fleet handoff [pid|name] write a short summary a fresh session can continue from
+/fleet kill [--handoff|--save]      close sessions safe to close (repeat to confirm)
+/fleet kill all [--handoff|--save]  close every idle session except this one
+
+● in progress: worth resuming · ◐ finished: hand off, then close · ○ light: just close
 /fleet retitle         forget the generated session titles and make new ones
 
-In the pane: ↑/↓ select · s save · x close (press twice) · c copy resume command · r refresh`
+In the pane: ↑/↓ select · h handoff · s save · x close (press twice) · c copy resume command · r refresh`
 
 export const register: Register = on => {
   let armed: Armed | null = null
@@ -622,7 +755,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'fleet',
       description: 'Every running Claude session: status, branch, context size; save or close them',
-      argumentHint: '[list|stale|save [pid]|kill [all] [--save]|retitle|help]',
+      argumentHint: '[list|stale|save [pid]|handoff [pid]|kill [all] [--handoff]|retitle|help]',
     })
 
     let tick = 0
@@ -664,6 +797,16 @@ export const register: Register = on => {
       }
     }
 
+    if (sub === 'handoff') {
+      const row = findRow(await scan($, true), arg)
+      if (!row) return { text: `No session matches "${arg}". /fleet list shows pids and names.` }
+      try {
+        return { text: `Handoff for ${label(row)} → ${await handoffSession($, row)}` }
+      } catch (err) {
+        return { text: `Couldn't write a handoff for ${label(row)}: ${(err as Error).message}` }
+      }
+    }
+
     if (sub === 'kill') {
       const [text, nextArmed] = await runKill($, arg, armed)
       armed = nextArmed
@@ -700,7 +843,7 @@ export const register: Register = on => {
     const ctxW = 10
     const projW = Math.max(8, Math.min(20, Math.floor(width * 0.16)))
     const gitW = hasGit ? Math.max(6, Math.min(22, Math.floor(width * 0.2))) : 0
-    const nameW = Math.max(10, width - 2 - 9 - projW - gitW - 5 - ctxW - 5)
+    const nameW = Math.max(10, width - 4 - 9 - projW - gitW - 5 - ctxW - 5)
     const room = Math.max(1, (e.viewport?.rows ?? 24) - 6)
 
     return (
@@ -722,7 +865,7 @@ export const register: Register = on => {
                 autoFocus={i === 0 && picked === null ? true : undefined}
                 onPress={() => { void update($, selected, () => r.key) }}
               />
-              <Text> </Text>
+              <Text color={r.value ? VALUE_COLOR[r.value] : undefined} dimColor={r.value === 'light'}>{` ${glyph(r)} `}</Text>
               {r.key === closing ? (
                 <Text color="red" bold wrap="truncate-end">{fit(`press x again to close ${label(r)}`, nameW)} </Text>
               ) : (
@@ -746,6 +889,8 @@ export const register: Register = on => {
         {snap.rows.length > room ? <Text dimColor>  +{snap.rows.length - room} more (/fleet list)</Text> : null}
         <Text> </Text>
         <Box>
+          <Button key="handoff" label="Handoff" hotkey="h" onPress={() => { void handoffSelected($) }} />
+          <Text> </Text>
           <Button key="save" label="Save" hotkey="s" onPress={() => { void saveSelected($) }} />
           <Text> </Text>
           <Button key="close" label="Close" hotkey="x" onPress={() => { void closeSelected($) }} />
@@ -754,7 +899,7 @@ export const register: Register = on => {
           <Text> </Text>
           <Button key="refresh" label="Refresh" hotkey="r" onPress={() => { void scan($, true) }} />
         </Box>
-        <Text dimColor wrap="truncate-end">↑/↓ select · ctx = tokens a resume re-caches · cold = cache expired</Text>
+        <Text dimColor wrap="truncate-end">● in progress  ◐ finished: hand off  ○ light · ctx = tokens a resume re-caches · cold = cache expired</Text>
       </Box>
     )
   })
