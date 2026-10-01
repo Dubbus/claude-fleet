@@ -4,13 +4,19 @@ A [Claude Code](https://claude.com/claude-code) mod that shows every Claude sess
 machine: what each one is working on, the state of its code, and how much context it holds.
 
 ```
-9 sessions · 2 busy · 3 idle > 7d · 1.4M tokens to re-cache · 3 safe to close
+10 sessions · 2 busy · 1 need you · 6 safe to close
+841k tokens to re-cache · 4 idle > 7d · 1 open in two windows
 
-▸ ● Auth middleware refactor        busy   api   feat/auth ✎4 ↑2   now        182k
-  ● Flaky checkout test triage      idle   web   main ✎30 ↑13       6d   161k cold
-  ◐ Postgres migration dry run      idle   api   master ✎3 ↑2      12d   338k cold
-  ○ Regex for ISO dates             idle   web   main               2d    14k cold
+  ● Payments webhook retry bug    waiting   api     fix/webhooks ✎1         2m        141k
+▸ ● Auth middleware refactor      busy      api     feat/auth ✎4 ↑2        now        182k
+  ● Flaky checkout test triage    idle      web     main ✎2               25m         96k
+  ◐ Release notes for v2.4        idle      docs    main                   3d    44k cold
+  ○ Regex for ISO dates           idle      web     main                   2d    14k cold
+  ◐ Postgres migration dry run    idle      api     master ↑2             12d   338k cold
+  ◐ GraphQL schema review ×2      idle      api     main                  30d   212k cold
 ```
+
+(The example data above is fleet's demo mode; see [Try it safely](#try-it-safely).)
 
 If you keep several sessions open, or run parallel agents in worktrees, it's easy to lose track of
 which ones are working, which are waiting on you, and which have been sitting on uncommitted work
@@ -29,14 +35,8 @@ for weeks.
 
   Worktrees of the current repo with no session in them show up too. A conversation resumed in two
   terminals is marked `×2`; closing the older window loses nothing.
-- **Keyboard controls in the pane:**
-  - **↑/↓** selects a session.
-  - **h** writes a handoff. Once it's written, the row offers **x** to close that session with one
-    press (for 20s), since its context now lives in the handoff.
-  - **s** saves the full conversation as Markdown.
-  - **x** closes it (press twice to confirm).
-  - **c** copies its `claude --resume` command.
-  - **r** refreshes.
+- **Keyboard controls in the pane** to hand off, save, close or resume a session; see
+  [Keyboard shortcuts](#keyboard-shortcuts).
 - **Context size and "cold":** the right column is how many tokens the session's next message
   sends. Once the prompt cache has expired (marked `cold`), that whole context gets cached again at
   full price. A 2M-token session you only half need is often cheaper to save and close than to resume.
@@ -65,7 +65,33 @@ for weeks.
 - **`/fleet list`**, **`/fleet stale`**, **`/fleet retitle`** and **`/fleet help`** print the same information as text.
   These also work in `claude -p`.
 
+## Keyboard shortcuts
+
+`/fleet` opens the pane and gives it the keyboard.
+
+| Key | What it does |
+| --- | --- |
+| **↑ / ↓** (or Tab) | Select a session. The selected row is highlighted. |
+| **h** | Write a handoff for the selected session. Once it's written, the row turns red and one press of **x** closes the session (for 20 seconds). |
+| **x** | Close the selected session. The row turns red; press **x** again within 10 seconds to confirm. Your own session and busy ones can't be closed. |
+| **s** | Save the full conversation as Markdown in the session's folder. |
+| **c** | Copy `cd <folder> && claude --resume <id>` to the clipboard. |
+| **r** | Refresh now (it also refreshes on its own every 5 seconds). |
+| **Esc** | Give the keyboard back to the prompt. The pane stays open. |
+| click the pane | Give the pane the keyboard again. |
+| **✕** on the pane | Close the pane. `/fleet` reopens it. |
+
+Every action can also be run as a command: `/fleet handoff`, `/fleet save`, `/fleet kill`; `/fleet help` lists them all.
+
 ## Install
+
+Requirements:
+
+- **Claude Code 2.1.286 or later.** Tested on 2.1.286 and 2.1.287. The mod API is early access, so a
+  later release may change it.
+- **Mods enabled for your account.** Mods are still rolling out; if Claude Code says *"hooks modules
+  are turned off … the rollout switch served off"*, your account doesn't have them yet.
+- **macOS or Linux.** fleet uses `ps`, `kill`, `head` and `tail`, so it doesn't run on Windows.
 
 ```sh
 git clone https://github.com/Dubbus/claude-fleet
@@ -74,7 +100,15 @@ claude --plugin-dir claude-fleet
 
 Or set `CLAUDE_CODE_PLUGIN_DIRS=/path/to/claude-fleet` to load it in every session.
 
-Built against Claude Code 2.1.286. The mod API is early access and may change between releases.
+## Try it safely
+
+```sh
+CLAUDE_FLEET_DEMO=1 claude --plugin-dir claude-fleet
+```
+
+This shows a fixed set of made-up sessions instead of your real ones, so you can try every key without
+touching anything: demo sessions have no transcripts and aren't real processes, so save, handoff and
+close all do nothing.
 
 ## How it works, and what leaves your machine
 

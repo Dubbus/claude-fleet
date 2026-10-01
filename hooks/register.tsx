@@ -200,7 +200,48 @@ const idleWorktrees = async ($: EngineInterface, taken: Set<string>): Promise<st
     .filter(path => !taken.has(path))
 }
 
+// CLAUDE_FLEET_DEMO=1: a fixed, made-up fleet for screenshots and trying the pane safely.
+// Demo rows have no transcripts and their pids aren't Claude processes, so no action can touch anything.
+const DEMO_PREFIX = 'demo-'
+
+const demoRows = (now: number): Row[] => {
+  const m = 60_000
+  const d = 24 * 60 * m
+  const git = (branch: string, dirty = 0, ahead = 0): Git => ({ branch, dirty, ahead, behind: 0, hasUpstream: true })
+  const row = (
+    n: number, title: string, status: string, cwd: string, idleMs: number, tokens: number | null,
+    value: ResumeValue | null, g: Git | null, extra: Partial<Row> = {},
+  ): Row => ({
+    key: `pid:${90000 + n}`, name: `demo-${n}`, isNamed: false, title, value, status,
+    cwd: `/home/dev/${cwd}`, pid: 90000 + n, sessionId: `${DEMO_PREFIX}${n}`,
+    updatedAt: now - idleMs, isSelf: false, git: g, tokens, ...extra,
+  })
+  return [
+    row(1, 'Payments webhook retry bug', 'waiting', 'api', 2 * m, 141_000, 'active', git('fix/webhooks', 1)),
+    row(0, 'Auth middleware refactor', 'busy', 'api', 0, 182_000, 'active', git('feat/auth', 4, 2), { isSelf: true }),
+    row(2, 'Onboarding copy rewrite', 'busy', 'web', 20_000, 58_000, 'active', git('feat/onboarding', 6, 1)),
+    row(3, 'Flaky checkout test triage', 'idle', 'web', 25 * m, 96_000, 'active', git('main', 2)),
+    row(4, 'Release notes for v2.4', 'idle', 'docs', 3 * d, 44_000, 'reference', git('main')),
+    row(5, 'Regex for ISO dates', 'idle', 'web', 2 * d, 14_000, 'light', git('main')),
+    row(6, 'Docker build cache question', 'idle', 'infra', 9 * d, 21_000, 'light', git('main')),
+    row(7, 'Postgres migration dry run', 'idle', 'api', 12 * d, 338_000, 'reference', git('master', 0, 2)),
+    row(8, 'GraphQL schema review', 'idle', 'api', 30 * d, 212_000, 'reference', git('main'), { sessionId: `${DEMO_PREFIX}8` }),
+    row(9, 'GraphQL schema review', 'idle', 'api', 31 * d, 212_000, 'reference', git('main'), { sessionId: `${DEMO_PREFIX}8` }),
+    {
+      key: 'wt:/home/dev/api-hotfix', name: '(no session)', isNamed: true, title: null, value: null, status: 'worktree',
+      cwd: '/home/dev/api-hotfix', pid: null, sessionId: '', updatedAt: 0, isSelf: false, git: git('hotfix/rate-limit'), tokens: null,
+    },
+  ]
+}
+
 const scan = async ($: EngineInterface, isFull: boolean) => {
+  if (await $.env.get('CLAUDE_FLEET_DEMO')) {
+    const now = await $.clock.now()
+    const demo: Snapshot = { rows: demoRows(now), scannedAt: now, warning: null }
+    await update($, snapshot, () => demo)
+    showStatus($, demo)
+    return demo
+  }
   const [registry, selfId, now, home, titles] = await Promise.all([
     readRegistry($), $.session.id(), $.clock.now(), $.env.get('HOME'), readTitles($),
   ])
@@ -271,21 +312,30 @@ const showStatus = ($: EngineInterface, snap: Snapshot) => {
   $.ui.status(parts.join(' · '))
 }
 
-const summary = (snap: Snapshot) => {
+// Headline counts, then the details; the pane draws them as two lines.
+const summaryParts = (snap: Snapshot): [string, string] => {
   const live = snap.rows.filter(r => r.pid !== null)
   const stale = live.filter(r => isStale(r, snap.scannedAt)).length
   const busy = live.filter(r => r.status === 'busy').length
   const cold = live.filter(r => !r.isSelf && isCold(r, snap.scannedAt)).reduce((sum, r) => sum + (r.tokens ?? 0), 0)
   const twice = [...windowCounts(live).values()].filter(n => n > 1).length
   const closable = live.filter(r => isClosable(r, snap.scannedAt)).length
-  return (
-    `${live.length} sessions · ${busy} busy` +
-    (stale ? ` · ${stale} idle > 7d` : '') +
-    (twice ? ` · ${twice} open in ${twice === 1 ? 'two windows' : 'several windows'}` : '') +
-    (cold ? ` · ${tokensText(cold)} tokens to re-cache` : '') +
-    (closable ? ` · ${closable} safe to close` : '')
-  )
+  const waiting = live.filter(r => needsYou(r.status)).length
+  const head = [
+    `${live.length} sessions`,
+    `${busy} busy`,
+    waiting ? `${waiting} need you` : '',
+    closable ? `${closable} safe to close` : '',
+  ]
+  const detail = [
+    cold ? `${tokensText(cold)} tokens to re-cache` : '',
+    stale ? `${stale} idle > 7d` : '',
+    twice ? `${twice} open in ${twice === 1 ? 'two windows' : 'several windows'}` : '',
+  ]
+  return [head.filter(Boolean).join(' · '), detail.filter(Boolean).join(' · ')]
 }
+
+const summary = (snap: Snapshot) => summaryParts(snap).filter(Boolean).join(' · ')
 
 const gitText = (git: Git | null) => {
   if (!git) return '—'
@@ -677,6 +727,8 @@ const selectedRow = async ($: EngineInterface) => {
   return snap?.rows.find(r => r.key === key) ?? null
 }
 
+const isDemo = (row: Row) => row.sessionId.startsWith(DEMO_PREFIX)
+
 const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`
 
 const copyResume = async ($: EngineInterface, surface: Parameters<EngineInterface['ui']['copy']>[0]['surface']) => {
@@ -692,6 +744,7 @@ const copyResume = async ($: EngineInterface, surface: Parameters<EngineInterfac
 const saveSelected = async ($: EngineInterface) => {
   const row = await selectedRow($)
   if (!row || row.pid === null) return $.ui.toast('Select a session first (↑/↓)')
+  if (isDemo(row)) return $.ui.toast('Demo mode: nothing to do for made-up sessions')
   try {
     $.ui.toast(`Saved → ${await saveSession($, row)}`)
   } catch (err) {
@@ -702,6 +755,7 @@ const saveSelected = async ($: EngineInterface) => {
 const handoffSelected = async ($: EngineInterface) => {
   const row = await selectedRow($)
   if (!row || row.pid === null) return $.ui.toast('Select a session first (↑/↓)')
+  if (isDemo(row)) return $.ui.toast('Demo mode: nothing to do for made-up sessions')
   $.ui.toast(`Writing a handoff for ${label(row)}…`)
   let target: string
   try {
@@ -727,6 +781,7 @@ const armClose = async ($: EngineInterface, row: Row, ms: number) => {
 const closeSelected = async ($: EngineInterface) => {
   const row = await selectedRow($)
   if (!row || row.pid === null) return $.ui.toast('Select a session first (↑/↓)')
+  if (isDemo(row)) return $.ui.toast('Demo mode: nothing to do for made-up sessions')
   if (row.isSelf) return $.ui.toast("That's this session; quit it with /exit")
   if (row.status !== 'idle') return $.ui.toast(`${label(row)} is ${row.status}; only idle sessions are closed`)
 
@@ -857,12 +912,13 @@ export const register: Register = on => {
     const projW = Math.max(8, Math.min(20, Math.floor(width * 0.16)))
     const gitW = hasGit ? Math.max(6, Math.min(22, Math.floor(width * 0.2))) : 0
     const nameW = Math.max(10, width - 4 - 9 - projW - gitW - 5 - ctxW - 5)
-    const room = Math.max(1, (e.viewport?.rows ?? 24) - 6)
+    const room = Math.max(1, (e.viewport?.rows ?? 24) - 7)
 
     return (
       <Box flexDirection="column">
         {snap.warning ? <Text color="red" wrap="wrap">⚠ {snap.warning}</Text> : null}
-        <Text bold wrap="truncate-end">{summary(snap)}</Text>
+        <Text bold wrap="truncate-end">{summaryParts(snap)[0]}</Text>
+        {summaryParts(snap)[1] ? <Text dimColor wrap="truncate-end">{summaryParts(snap)[1]}</Text> : null}
         <Text> </Text>
         {snap.rows.slice(0, room).map((r, i) => {
           const isPicked = r.key === picked
