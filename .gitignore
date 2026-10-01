@@ -5,5 +5,6 @@ tsconfig.json
 
 # Session exports from /fleet save
 claude-context-*.md
+claude-handoff-*.txt
 
 .DS_Store

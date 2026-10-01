@@ -30,6 +30,8 @@ const HANDOFF_INPUT_CHARS = 400_000
 const HANDOFF_HEAD_CHARS = 60_000
 // A second press of x within this window closes the selected session.
 const CLOSE_CONFIRM_MS = 10_000
+// After a handoff, one press of x within this window closes that session.
+const AFTER_HANDOFF_MS = 20_000
 
 // Claude Code writes one <pid>.json per running session here. It is an internal
 // file, not an API: read only the fields below and never the rest (it holds tokens).
@@ -409,12 +411,12 @@ const readTranscript = async ($: EngineInterface, row: Row) => {
   return String(await $.fs.read(source))
 }
 
-// `<folder>/<prefix>-<title>-<date>.md`, numbered when that name is taken.
-const freshPath = async ($: EngineInterface, row: Row, prefix: string, now: Date) => {
+// `<folder>/<prefix>-<title>-<date>.<ext>`, numbered when that name is taken.
+const freshPath = async ($: EngineInterface, row: Row, prefix: string, now: Date, ext = 'md') => {
   const slug = label(row).replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 60)
   const stem = `${row.cwd}/${prefix}-${slug}-${now.toISOString().slice(0, 10)}`
-  let target = `${stem}.md`
-  for (let n = 2; await $.fs.exists(target); n++) target = `${stem}-${n}.md`
+  let target = `${stem}.${ext}`
+  for (let n = 2; await $.fs.exists(target); n++) target = `${stem}-${n}.${ext}`
   return target
 }
 
@@ -455,7 +457,7 @@ const handoffSession = async ($: EngineInterface, row: Row): Promise<string> => 
   const r = await $.model.complete({ model: 'sonnet', system: HANDOFF_SYSTEM, prompt: text, maxTokens: 3000 })
   if (!r.isAnswered) throw new Error(`the summary call failed (${r.reason})`)
 
-  const target = await freshPath($, row, 'claude-handoff', now)
+  const target = await freshPath($, row, 'claude-handoff', now, 'txt')
   const doc = [
     `# Handoff: ${label(row)}`,
     '',
@@ -701,11 +703,25 @@ const handoffSelected = async ($: EngineInterface) => {
   const row = await selectedRow($)
   if (!row || row.pid === null) return $.ui.toast('Select a session first (↑/↓)')
   $.ui.toast(`Writing a handoff for ${label(row)}…`)
+  let target: string
   try {
-    $.ui.toast(`Handoff → ${await handoffSession($, row)}`)
+    target = await handoffSession($, row)
   } catch (err) {
-    $.ui.toast(`Couldn't write a handoff: ${(err as Error).message}`)
+    return $.ui.toast(`Couldn't write a handoff: ${(err as Error).message}`)
   }
+
+  // The context now lives in the handoff, so offer to close the session with one press.
+  if (row.isSelf || row.status !== 'idle') return $.ui.toast(`Handoff → ${target}`)
+  await armClose($, row, AFTER_HANDOFF_MS)
+  $.ui.toast(`Handoff → ${target} · press x to close the session`)
+}
+
+// Marks `row` so the next x closes it, until `ms` pass or another row is armed.
+const armClose = async ($: EngineInterface, row: Row, ms: number) => {
+  await update($, pendingClose, () => row.key)
+  $.clock.after(ms, () => {
+    void update($, pendingClose, key => (key === row.key ? null : key))
+  })
 }
 
 const closeSelected = async ($: EngineInterface) => {
@@ -715,10 +731,7 @@ const closeSelected = async ($: EngineInterface) => {
   if (row.status !== 'idle') return $.ui.toast(`${label(row)} is ${row.status}; only idle sessions are closed`)
 
   if ((await read($, pendingClose)) !== row.key) {
-    await update($, pendingClose, () => row.key)
-    $.clock.after(CLOSE_CONFIRM_MS, () => {
-      void update($, pendingClose, key => (key === row.key ? null : key))
-    })
+    await armClose($, row, CLOSE_CONFIRM_MS)
     return $.ui.toast(`Press x again to close ${label(row)} (h writes a handoff first)`)
   }
 
@@ -867,7 +880,7 @@ export const register: Register = on => {
               />
               <Text color={r.value ? VALUE_COLOR[r.value] : undefined} dimColor={r.value === 'light'}>{` ${glyph(r)} `}</Text>
               {r.key === closing ? (
-                <Text color="red" bold wrap="truncate-end">{fit(`press x again to close ${label(r)}`, nameW)} </Text>
+                <Text color="red" bold wrap="truncate-end">{fit(`x to close: ${label(r)}`, nameW)} </Text>
               ) : (
                 <Text bold={r.isSelf || isPicked} inverse={isPicked} color={r.isSelf ? 'cyan' : undefined} dimColor={stale && !isPicked} wrap="truncate-end">
                   {fitLabel(r, counts, nameW)}

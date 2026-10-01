@@ -31,7 +31,8 @@ for weeks.
   terminals is marked `×2`; closing the older window loses nothing.
 - **Keyboard controls in the pane:**
   - **↑/↓** selects a session.
-  - **h** writes a handoff.
+  - **h** writes a handoff. Once it's written, the row offers **x** to close that session with one
+    press (for 20s), since its context now lives in the handoff.
   - **s** saves the full conversation as Markdown.
   - **x** closes it (press twice to confirm).
   - **c** copies its `claude --resume` command.
@@ -45,7 +46,7 @@ for weeks.
   - **○** *light*: quick questions. Just close it.
 
   The same Haiku call that writes the title makes this judgment, so it costs nothing extra.
-- **`/fleet handoff [pid|name]`** (or **h** in the pane) writes `claude-handoff-<title>-<date>.md` in the
+- **`/fleet handoff [pid|name]`** (or **h** in the pane) writes `claude-handoff-<title>-<date>.txt` in the
   session's folder. It's a short summary: the goal, status, decisions and why, next steps, key files,
   and gotchas. A fresh session can continue from about 3k tokens instead of re-caching the whole
   conversation, and the original session stays resumable.
