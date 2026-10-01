@@ -18,7 +18,12 @@ export type Row = {
   tokens: number | null
 }
 
-export type Snapshot = { rows: Row[]; scannedAt: number }
+export type Snapshot = {
+  rows: Row[]
+  scannedAt: number
+  // Why the list may be wrong or empty (the registry moved or changed format), else null.
+  warning: string | null
+}
 
 declare module 'claude-code' {
   interface PluginState {

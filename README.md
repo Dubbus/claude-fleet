@@ -26,7 +26,8 @@ for weeks.
   - time since it was last active
   - its **context size**
 
-  Worktrees of the current repo with no session in them show up too.
+  Worktrees of the current repo with no session in them show up too. A conversation resumed in two
+  terminals is marked `×2`; closing the older window loses nothing.
 - **Keyboard controls in the pane:**
   - **↑/↓** selects a session.
   - **s** saves it as Markdown.
@@ -79,7 +80,8 @@ Built against Claude Code 2.1.286. The mod API is early access and may change be
 Everything else stays local, and there are no dependencies.
 
 `~/.claude/sessions/` is an internal Claude Code file, not a public API, so a future release may
-change it.
+change it. If that happens, fleet tells you in the pane, the status line and `/fleet list`, rather than
+showing an empty list. If the registry has moved, set `CLAUDE_FLEET_REGISTRY` to the new folder.
 
 ## License
 

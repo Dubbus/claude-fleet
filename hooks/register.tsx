@@ -55,6 +55,21 @@ const fit = (text: string, width: number) =>
 
 const label = (row: Row) => (row.isNamed ? row.name : row.title ?? row.name)
 
+// The same conversation resumed in two terminals shows up as two processes with one sessionId.
+const windowCounts = (rows: Row[]) => {
+  const counts = new Map<string, number>()
+  for (const r of rows) if (r.sessionId) counts.set(r.sessionId, (counts.get(r.sessionId) ?? 0) + 1)
+  return counts
+}
+
+// Fits the label to `width`, keeping a ×N marker visible by shortening the label instead.
+const fitLabel = (row: Row, counts: Map<string, number>, width: number) => {
+  const n = counts.get(row.sessionId) ?? 1
+  if (n <= 1) return fit(label(row), width)
+  const mark = ` ×${n}`
+  return (fit(label(row), width - mark.length).trimEnd() + mark).padEnd(width)
+}
+
 const isStale = (row: Row, now: number) => row.status === 'idle' && now - row.updatedAt > STALE_MS
 
 const isCold = (row: Row, now: number) => row.pid !== null && now - row.updatedAt > CACHE_TTL_MS
@@ -65,15 +80,24 @@ const needsYou = (status: string) => status !== 'idle' && status !== 'busy' && s
 const transcriptPath = (home: string, row: Row) =>
   `${home}/${PROJECTS_DIR}/${row.cwd.replace(/[^A-Za-z0-9]/g, '-')}/${row.sessionId}.jsonl`
 
-const readRegistry = async ($: EngineInterface): Promise<Registered[]> => {
+// The registry is internal to Claude Code, so a release can move or reshape it.
+// Every way it can fail says why, rather than showing an empty fleet.
+const readRegistry = async ($: EngineInterface): Promise<{ sessions: Registered[]; problem: string | null }> => {
   const home = await $.env.get('HOME')
-  if (!home) return []
-  const dir = `${home}/${REGISTRY_DIR}`
-  if (!(await $.fs.exists(dir))) return []
+  // CLAUDE_FLEET_REGISTRY points fleet at another registry folder (a moved one, or a test fixture).
+  const override = await $.env.get('CLAUDE_FLEET_REGISTRY')
+  if (!home && !override) return { sessions: [], problem: "HOME isn't set, so fleet can't find ~/.claude/sessions." }
+  const dir = override || `${home}/${REGISTRY_DIR}`
+  const shown = override || `~/${REGISTRY_DIR}`
+  if (!(await $.fs.exists(dir))) {
+    return { sessions: [], problem: `No ${shown} folder: this Claude Code version may keep its session list elsewhere.` }
+  }
 
   const found: Registered[] = []
+  let files = 0
   for (const entry of await $.fs.list(dir)) {
     if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
+    files += 1
     try {
       const raw = JSON.parse(String(await $.fs.read(`${dir}/${entry.name}`)))
       if (typeof raw.pid !== 'number' || typeof raw.cwd !== 'string') continue
@@ -91,12 +115,17 @@ const readRegistry = async ($: EngineInterface): Promise<Registered[]> => {
       // A file mid-write or from another version: skip it this tick.
     }
   }
-  if (found.length === 0) return []
+  if (files === 0) return { sessions: [], problem: `${shown} is empty, though this session is running: the registry may have moved.` }
+  if (found.length === 0) {
+    return { sessions: [], problem: `Couldn't read any of the ${files} files in ${shown}: their format may have changed.` }
+  }
 
   // Registry files outlive crashed processes; keep only the pids still running.
   const ps = await $.process.run(['ps', '-o', 'pid=', '-p', found.map(r => r.pid).join(',')], { timeoutMs: 3000 })
   const alive = new Set(ps.stdout.split('\n').map(line => Number(line.trim())).filter(Boolean))
-  return found.filter(r => alive.has(r.pid))
+  // This session is always running, so nothing alive means ps itself failed.
+  if (alive.size === 0) return { sessions: [], problem: `Couldn't check which sessions are running (ps: ${ps.stderr.trim() || `exit ${ps.exitCode}`}).` }
+  return { sessions: found.filter(r => alive.has(r.pid)), problem: null }
 }
 
 const gitStatus = async ($: EngineInterface, cwd: string): Promise<Git | null> => {
@@ -156,9 +185,10 @@ const idleWorktrees = async ($: EngineInterface, taken: Set<string>): Promise<st
 }
 
 const scan = async ($: EngineInterface, isFull: boolean) => {
-  const [sessions, selfId, now, home, titles] = await Promise.all([
+  const [registry, selfId, now, home, titles] = await Promise.all([
     readRegistry($), $.session.id(), $.clock.now(), $.env.get('HOME'), readTitles($),
   ])
+  const sessions = registry.sessions
 
   const rows: Row[] = sessions.map(s => ({
     key: `pid:${s.pid}`,
@@ -202,7 +232,10 @@ const scan = async ($: EngineInterface, isFull: boolean) => {
   const rank = (r: Row) => (needsYou(r.status) ? 0 : r.status === 'busy' ? 1 : r.status === 'worktree' ? 3 : 2)
   rows.sort((a, b) => rank(a) - rank(b) || b.updatedAt - a.updatedAt)
 
-  const next: Snapshot = { rows, scannedAt: now }
+  const warning =
+    registry.problem ??
+    (rows.some(r => r.isSelf) ? null : "This session isn't in ~/.claude/sessions, so the list may be incomplete.")
+  const next: Snapshot = { rows, scannedAt: now, warning }
   await update($, snapshot, () => next)
   showStatus($, next)
   if (isFull && home) void refreshTitles($, home, rows, titles).catch(() => undefined)
@@ -210,6 +243,7 @@ const scan = async ($: EngineInterface, isFull: boolean) => {
 }
 
 const showStatus = ($: EngineInterface, snap: Snapshot) => {
+  if (snap.warning) return $.ui.status("⧉ fleet can't read sessions (/fleet)")
   const live = snap.rows.filter(r => r.pid !== null)
   if (live.length <= 1) return $.ui.status(undefined)
   const busy = live.filter(r => r.status === 'busy').length
@@ -225,9 +259,11 @@ const summary = (snap: Snapshot) => {
   const stale = live.filter(r => isStale(r, snap.scannedAt)).length
   const busy = live.filter(r => r.status === 'busy').length
   const cold = live.filter(r => !r.isSelf && isCold(r, snap.scannedAt)).reduce((sum, r) => sum + (r.tokens ?? 0), 0)
+  const twice = [...windowCounts(live).values()].filter(n => n > 1).length
   return (
     `${live.length} sessions · ${busy} busy` +
     (stale ? ` · ${stale} idle > 7d` : '') +
+    (twice ? ` · ${twice} open in ${twice === 1 ? 'two windows' : 'several windows'}` : '') +
     (cold ? ` · ${tokensText(cold)} tokens to re-cache` : '')
   )
 }
@@ -241,10 +277,10 @@ const gitText = (git: Git | null) => {
 const ctxText = (row: Row, now: number) =>
   row.pid === null ? '' : `${tokensText(row.tokens)}${row.tokens !== null && isCold(row, now) ? ' cold' : ''}`
 
-const tableLine = (r: Row, now: number, hasGit = true) =>
+const tableLine = (r: Row, now: number, hasGit = true, counts = new Map<string, number>()) =>
   [
     r.isSelf ? '▸' : ' ',
-    fit(label(r), 34),
+    fitLabel(r, counts, 34),
     fit(r.status, 9),
     fit(basename(r.cwd), 22),
     hasGit ? fit(gitText(r.git), 22) : '',
@@ -252,16 +288,25 @@ const tableLine = (r: Row, now: number, hasGit = true) =>
     ctxText(r, now).padStart(11),
   ].join(' ')
 
-const asTable = (snap: Snapshot) =>
-  `${summary(snap)}\n\n${snap.rows.map(r => tableLine(r, snap.scannedAt, snap.rows.some(x => x.git))).join('\n')}\n\n` +
-  `ctx = context the session re-caches on its next message; "cold" = cache expired, so that costs the full amount.`
+const asTable = (snap: Snapshot) => {
+  const counts = windowCounts(snap.rows)
+  const hasGit = snap.rows.some(x => x.git)
+  return (
+    (snap.warning ? `⚠ ${snap.warning}\n\n` : '') +
+    `${summary(snap)}\n\n${snap.rows.map(r => tableLine(r, snap.scannedAt, hasGit, counts)).join('\n')}\n\n` +
+    `ctx = context the session re-caches on its next message; "cold" = cache expired, so that costs the full amount.` +
+    (counts.size && [...counts.values()].some(n => n > 1)
+      ? `\n×2 = the same conversation open in two terminals; closing the older one loses nothing.`
+      : '')
+  )
+}
 
 const staleReport = (snap: Snapshot) => {
   const stale = snap.rows.filter(r => r.pid !== null && !r.isSelf && isStale(r, snap.scannedAt))
   if (stale.length === 0) return 'No sessions idle for more than 7 days.'
   return (
     `${stale.length} sessions idle for more than 7 days:\n\n` +
-    `${stale.map(r => `  ${String(r.pid).padStart(6)}  ${tableLine(r, snap.scannedAt)}`).join('\n')}\n\n` +
+    `${stale.map(r => `  ${String(r.pid).padStart(6)}  ${tableLine(r, snap.scannedAt, true, windowCounts(snap.rows))}`).join('\n')}\n\n` +
     `/fleet kill closes these (add --save to export each conversation first).`
   )
 }
@@ -392,7 +437,7 @@ const runKill = async ($: EngineInterface, args: string, armed: Armed | null): P
     const tokens = targets.reduce((sum, r) => sum + (r.tokens ?? 0), 0)
     return [
       `This would close ${targets.length} ${scope}` + (tokens ? ` (${tokensText(tokens)} tokens of context):` : ':') + '\n\n' +
-        targets.map(r => `  ${String(r.pid).padStart(6)}  ${tableLine(r, snap.scannedAt)}`).join('\n') + '\n\n' +
+        targets.map(r => `  ${String(r.pid).padStart(6)}  ${tableLine(r, snap.scannedAt, true, windowCounts(snap.rows))}`).join('\n') + '\n\n' +
         (isSave ? 'Each conversation is saved as Markdown in its folder first.\n' : 'Add --save to export each conversation as Markdown first.\n') +
         `Run /fleet kill${args ? ` ${args}` : ''} again within 60s to confirm. Conversations stay resumable with claude --resume.`,
       { args: key, pids: targets.map(t => t.pid!), at: snap.scannedAt },
@@ -649,6 +694,7 @@ export const register: Register = on => {
     const [picked, closing] = await Promise.all([read($, selected), read($, pendingClose)])
 
     const now = snap.scannedAt
+    const counts = windowCounts(snap.rows)
     const hasGit = snap.rows.some(r => r.git)
     const width = e.props.bodyColumns
     const ctxW = 10
@@ -659,6 +705,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
+        {snap.warning ? <Text color="red" wrap="wrap">⚠ {snap.warning}</Text> : null}
         <Text bold wrap="truncate-end">{summary(snap)}</Text>
         <Text> </Text>
         {snap.rows.slice(0, room).map((r, i) => {
@@ -680,7 +727,7 @@ export const register: Register = on => {
                 <Text color="red" bold wrap="truncate-end">{fit(`press x again to close ${label(r)}`, nameW)} </Text>
               ) : (
                 <Text bold={r.isSelf || isPicked} inverse={isPicked} color={r.isSelf ? 'cyan' : undefined} dimColor={stale && !isPicked} wrap="truncate-end">
-                  {fit(label(r), nameW)}
+                  {fitLabel(r, counts, nameW)}
                 </Text>
               )}
               <Text> </Text>
