@@ -1,0 +1,12 @@
+{
+  "name": "fleet",
+  "version": "0.1.0",
+  "description": "See every running Claude Code session and worktree at a glance: status, branch, uncommitted work, staleness",
+  "author": {
+    "name": "Adarsh Muralidharan"
+  },
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "repository": "https://github.com/Dubbus/claude-fleet",
+  "homepage": "https://github.com/Dubbus/claude-fleet"
+}

@@ -1,0 +1,9 @@
+# Written by Claude Code / plugin-types for local type-checking
+tsconfig.json
+.claude-plugin/types/
+.claude/
+
+# Session exports from /fleet save
+claude-context-*.md
+
+.DS_Store
