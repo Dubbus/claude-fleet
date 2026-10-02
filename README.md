@@ -65,6 +65,27 @@ for weeks.
 - **`/fleet list`**, **`/fleet stale`**, **`/fleet retitle`** and **`/fleet help`** print the same information as text.
   These also work in `claude -p`.
 
+## While you work
+
+These only work as a mod, since they react to the session you're in:
+
+- **A handoff offer before your context gets expensive.** When this session passes 300k tokens, a band
+  above the prompt offers to write a handoff. You can pick:
+  - **Hand off and start fresh:** writes the handoff, runs `/clear`, and opens the new conversation with
+    "Read <handoff> and pick up where it leaves off".
+  - **Just write it.**
+  - **Later:** asks again after another 100k tokens.
+
+  Set `CLAUDE_FLEET_HANDOFF_AT` to change the threshold. `/fleet handoff --fresh` does the same thing
+  as a command.
+- **A pause on `/exit`** when the session is in progress or holds over 100k tokens. You can run
+  `/fleet handoff --exit` to hand off and then exit, or run `/exit` again within 30 seconds to quit
+  anyway. Set `CLAUDE_FLEET_EXIT_CHECK=0` to turn this off. (It catches `/exit` only, not ctrl+c.)
+- **A toast when another session needs you**, for example when it's waiting on a permission prompt,
+  and another when a busy session finishes. Set `CLAUDE_FLEET_NOTIFY=0` to turn these off.
+
+To use a band's buttons, give it the keyboard with ctrl+x then Tab, or click it.
+
 ## Keyboard shortcuts
 
 `/fleet` opens the pane and gives it the keyboard.

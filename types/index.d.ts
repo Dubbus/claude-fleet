@@ -30,6 +30,13 @@ export type Snapshot = {
   warning: string | null
 }
 
+// What the band above the prompt is offering, for this session only.
+export type Band =
+  | { kind: 'context'; tokens: number }
+  | { kind: 'exit'; tokens: number; value: ResumeValue | null }
+  | { kind: 'handedOff'; path: string; then: 'fresh' | 'exit' | null }
+  | { kind: 'working'; text: string }
+
 declare module 'claude-code' {
   interface PluginState {
     fleet: {
@@ -39,6 +46,7 @@ declare module 'claude-code' {
       selected: string | null
       // A row whose close was asked once and waits for the second press.
       pendingClose: string | null
+      band: Band | null
     }
   }
 }

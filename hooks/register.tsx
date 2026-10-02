@@ -1,13 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Git, ResumeValue, Row, Snapshot } from '../types'
+import type { Band, Git, ResumeValue, Row, Snapshot } from '../types'
 
 const PANE = 'fleet'
 const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
 const isOpen = atom({ plugin: 'fleet', key: 'isOpen' } as const, false)
 const selected = atom({ plugin: 'fleet', key: 'selected' } as const, null)
 const pendingClose = atom({ plugin: 'fleet', key: 'pendingClose' } as const, null)
+const band = atom({ plugin: 'fleet', key: 'band' } as const, null)
 
 const TICK_MS = 5000
 // The status line only needs the registry; git and token reads run only while the pane is open.
@@ -28,6 +29,13 @@ const TITLES_PER_SCAN = 2
 // Handoffs summarize at most this much of a transcript (head kept for the goal, the rest from the end).
 const HANDOFF_INPUT_CHARS = 400_000
 const HANDOFF_HEAD_CHARS = 60_000
+// The band offers a handoff once this session's context passes this (CLAUDE_FLEET_HANDOFF_AT overrides),
+// and again each time it grows by HANDOFF_SNOOZE_TOKENS after "Later".
+const HANDOFF_AT_TOKENS = 300_000
+const HANDOFF_SNOOZE_TOKENS = 100_000
+// /exit pauses to offer a handoff when the session is in progress or at least this big.
+const EXIT_CHECK_TOKENS = 100_000
+const EXIT_CONFIRM_MS = 30_000
 // A second press of x within this window closes the selected session.
 const CLOSE_CONFIRM_MS = 10_000
 // After a handoff, one press of x within this window closes that session.
@@ -98,6 +106,33 @@ const transcriptPath = (home: string, row: Row) =>
 
 // The registry is internal to Claude Code, so a release can move or reshape it.
 // Every way it can fail says why, rather than showing an empty fleet.
+// Transcripts are filed under the folder a session started in, which can differ from where it is
+// now, so fall back to looking for the session's file in every project folder.
+const transcriptCache = new Map<string, { path: string | null; at: number }>()
+const MISSING_RETRY_MS = 60_000
+
+const findTranscript = async ($: EngineInterface, home: string, row: Pick<Row, 'cwd' | 'sessionId'>) => {
+  if (!row.sessionId) return null
+  const direct = transcriptPath(home, row as Row)
+  if (await $.fs.exists(direct)) return direct
+
+  const now = await $.clock.now()
+  const hit = transcriptCache.get(row.sessionId)
+  if (hit && (hit.path ? await $.fs.exists(hit.path) : now - hit.at < MISSING_RETRY_MS)) return hit.path
+
+  let found: string | null = null
+  for (const entry of await $.fs.list(`${home}/${PROJECTS_DIR}`)) {
+    if (entry.kind !== 'dir') continue
+    const path = `${home}/${PROJECTS_DIR}/${entry.name}/${row.sessionId}.jsonl`
+    if (await $.fs.exists(path)) {
+      found = path
+      break
+    }
+  }
+  transcriptCache.set(row.sessionId, { path: found, at: now })
+  return found
+}
+
 const readRegistry = async ($: EngineInterface): Promise<{ sessions: Registered[]; problem: string | null }> => {
   const home = await $.env.get('HOME')
   // CLAUDE_FLEET_REGISTRY points fleet at another registry folder (a moved one, or a test fixture).
@@ -242,8 +277,8 @@ const scan = async ($: EngineInterface, isFull: boolean) => {
     showStatus($, demo)
     return demo
   }
-  const [registry, selfId, now, home, titles] = await Promise.all([
-    readRegistry($), $.session.id(), $.clock.now(), $.env.get('HOME'), readTitles($),
+  const [registry, selfId, now, home, titles, previous] = await Promise.all([
+    readRegistry($), $.session.id(), $.clock.now(), $.env.get('HOME'), readTitles($), read($, snapshot),
   ])
   const sessions = registry.sessions
 
@@ -275,7 +310,8 @@ const scan = async ($: EngineInterface, isFull: boolean) => {
     for (const row of rows) if (!byCwd.has(row.cwd)) byCwd.set(row.cwd, gitStatus($, row.cwd))
     for (const row of rows) {
       row.git = await byCwd.get(row.cwd)!
-      if (home && row.sessionId) row.tokens = await contextTokens($, transcriptPath(home, row))
+      const path = home ? await findTranscript($, home, row) : null
+      if (path) row.tokens = await contextTokens($, path)
     }
   } else {
     // Keep the last readings so the pane doesn't flicker between full scans.
@@ -296,6 +332,7 @@ const scan = async ($: EngineInterface, isFull: boolean) => {
   const next: Snapshot = { rows, scannedAt: now, warning }
   await update($, snapshot, () => next)
   showStatus($, next)
+  if (previous && !previous.warning) await notifyChanges($, previous, next)
   if (isFull && home) void refreshTitles($, home, rows, titles).catch(() => undefined)
   return next
 }
@@ -455,8 +492,8 @@ const toMarkdown = (row: Row, jsonl: string, exportedAt: string) => {
 const readTranscript = async ($: EngineInterface, row: Row) => {
   const home = await $.env.get('HOME')
   if (!home || !row.sessionId) throw new Error('no transcript for this session')
-  const source = transcriptPath(home, row)
-  if (!(await $.fs.exists(source))) throw new Error('transcript not found')
+  const source = await findTranscript($, home, row)
+  if (!source) throw new Error('transcript not found')
   if ((await $.fs.stat(source)).size > EXPORT_MAX_BYTES) throw new Error('transcript is over 80 MB')
   return String(await $.fs.read(source))
 }
@@ -684,8 +721,8 @@ const refreshTitles = async ($: EngineInterface, home: string, rows: Row[], titl
   const due: { row: Row; path: string; size: number }[] = []
   for (const row of rows) {
     if (!row.sessionId || row.isNamed || titling.has(row.sessionId)) continue
-    const path = transcriptPath(home, row)
-    if (!(await $.fs.exists(path))) continue
+    const path = await findTranscript($, home, row)
+    if (!path) continue
     const { size } = await $.fs.stat(path)
     const known = titles[row.sessionId]
     if (!known || !known.value || size > known.size * 2) due.push({ row, path, size })
@@ -797,6 +834,99 @@ const closeSelected = async ($: EngineInterface) => {
   void scan($, true)
 }
 
+// --- Telling you when another session changes ---
+
+// A toast when another session starts waiting on you, or finishes what it was doing.
+// CLAUDE_FLEET_NOTIFY=0 turns these off.
+const notifyChanges = async ($: EngineInterface, before: Snapshot, after: Snapshot) => {
+  if ((await $.env.get('CLAUDE_FLEET_NOTIFY')) === '0') return
+  const was = new Map(before.rows.map(r => [r.key, r.status]))
+  for (const row of after.rows) {
+    const prev = was.get(row.key)
+    if (row.isSelf || row.pid === null || prev === undefined || prev === row.status) continue
+    if (needsYou(row.status) && !needsYou(prev)) $.ui.toast(`⚠ ${label(row)} needs you (${row.status})`)
+    else if (prev === 'busy' && row.status === 'idle') $.ui.toast(`✓ ${label(row)} finished`)
+  }
+}
+
+// --- This session: offering a handoff before it gets expensive, and before /exit ---
+
+const selfRow = async ($: EngineInterface): Promise<Row> => {
+  const [snap, sessionId, cwd, titles] = await Promise.all([read($, snapshot), $.session.id(), $.session.cwd(), readTitles($)])
+  const known = snap?.rows.find(r => r.isSelf)
+  if (known) return known
+  return {
+    key: 'self', name: basename(cwd), isNamed: false, title: titles[sessionId]?.title ?? null,
+    value: titles[sessionId]?.value ?? null, status: 'busy', cwd, pid: null, sessionId,
+    updatedAt: 0, isSelf: true, git: null, tokens: null,
+  }
+}
+
+const selfTokens = async ($: EngineInterface) => {
+  const home = await $.env.get('HOME')
+  const row = await selfRow($)
+  const path = home ? await findTranscript($, home, row) : null
+  return path ? await contextTokens($, path) : null
+}
+
+const handoffThreshold = async ($: EngineInterface) => {
+  const raw = Number(await $.env.get('CLAUDE_FLEET_HANDOFF_AT'))
+  return Number.isFinite(raw) && raw > 0 ? raw : HANDOFF_AT_TOKENS
+}
+
+// Runs a built-in command on a timer: a command or press handler that awaits another
+// command (or a prompt) directly would wait on itself.
+const runLater = ($: EngineInterface, command: string) => {
+  $.clock.after(0, () => {
+    void $.command.run({ command }).catch(() => $.ui.toast(`fleet: couldn't run /${command}`))
+  })
+}
+
+const promptLater = ($: EngineInterface, text: string) => {
+  $.clock.after(0, () => {
+    void $.prompt.submit({ text }).catch(() => $.ui.toast("fleet: couldn't start the prompt"))
+  })
+}
+
+const continuePrompt = (path: string) =>
+  `Read ${path} and pick up where it leaves off. It's a handoff from my previous session in this folder.`
+
+// Writes a handoff for this session, then optionally starts fresh from it or exits.
+const handOffSelf = async ($: EngineInterface, then: 'fresh' | 'exit' | null) => {
+  // Whatever happens next, don't offer again until the context grows past this point.
+  snoozedAt = (await selfTokens($)) ?? snoozedAt
+  await update($, band, () => ({ kind: 'working', text: 'Writing a handoff for this session…' }) satisfies Band)
+  let path: string
+  try {
+    path = (await handoffSession($, await selfRow($))).split('  (')[0]
+  } catch (err) {
+    await update($, band, () => null)
+    $.ui.toast(`Couldn't write a handoff: ${(err as Error).message}`)
+    return null
+  }
+  if (then === 'exit') {
+    exitApproved = true
+    runLater($, 'exit')
+  } else if (then === 'fresh') {
+    startFresh($, path)
+  } else {
+    await update($, band, () => ({ kind: 'handedOff', path, then: null }) satisfies Band)
+  }
+  return path
+}
+
+const startFresh = ($: EngineInterface, path: string) => {
+  void update($, band, () => null)
+  runLater($, 'clear')
+  // /clear first, then the handoff as the new conversation's first message.
+  $.clock.after(500, () => promptLater($, continuePrompt(path)))
+}
+
+// Set when the person chose to exit, so the next /exit isn't held again.
+let exitApproved = false
+let exitAskedAt = 0
+let snoozedAt = 0
+
 const openPane = async ($: EngineInterface) => {
   await update($, isOpen, () => true)
   await $.ui.open({ id: PANE, title: 'Fleet', focus: true })
@@ -808,6 +938,8 @@ const HELP = `/fleet                 open the live pane
 /fleet stale           sessions idle for more than 7 days
 /fleet save [pid|name]    export a whole conversation as Markdown in its folder (default: this one)
 /fleet handoff [pid|name] write a short summary a fresh session can continue from
+/fleet handoff --fresh    hand off this session, /clear, and continue from the handoff
+/fleet handoff --exit     hand off this session, then exit
 /fleet kill [--handoff|--save]      close sessions safe to close (repeat to confirm)
 /fleet kill all [--handoff|--save]  close every idle session except this one
 
@@ -839,6 +971,42 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId || (await $.env.get('CLAUDE_FLEET_DEMO'))) return result
+    $.clock.after(0, () => {
+      void (async () => {
+        const [tokens, at, current] = await Promise.all([selfTokens($), handoffThreshold($), read($, band)])
+        if (tokens === null || tokens < at || tokens < snoozedAt + HANDOFF_SNOOZE_TOKENS) return
+        if (current && current.kind !== 'context') return
+        await update($, band, () => ({ kind: 'context', tokens }) satisfies Band)
+      })().catch(() => undefined)
+    })
+    return result
+  })
+
+  // /exit: when this session has work in progress or a big context, offer a handoff first.
+  on('command.run', { command: 'exit' }, async ($, e, next) => {
+    const now = await $.clock.now()
+    if (exitApproved || now - exitAskedAt < EXIT_CONFIRM_MS || (await $.env.get('CLAUDE_FLEET_EXIT_CHECK')) === '0') {
+      return next(e)
+    }
+    const [row, tokens] = await Promise.all([selfRow($), selfTokens($)])
+    const isWorthIt = row.value === 'active' || (tokens ?? 0) >= EXIT_CHECK_TOKENS
+    if (!isWorthIt) return next(e)
+
+    exitAskedAt = now
+    await update($, band, () => ({ kind: 'exit', tokens: tokens ?? 0, value: row.value }) satisfies Band)
+    const why = row.value === 'active' ? 'is still in progress' : `holds ${tokensText(tokens)} tokens of context`
+    return {
+      text:
+        `This session ${why}.\n` +
+        `  /fleet handoff --exit   write a handoff, then exit\n` +
+        `  /exit                   exit anyway (within 30s)\n` +
+        `The band above the prompt has the same choices (ctrl+x then Tab, or click it).`,
+    }
+  })
+
   on('command.run', { command: 'fleet' }, async ($, e) => {
     const args = e.args.trim()
     const [sub = '', ...rest] = args.split(/\s+/)
@@ -865,6 +1033,18 @@ export const register: Register = on => {
       }
     }
 
+    if (sub === 'handoff' && (arg === '--fresh' || arg === '--exit')) {
+      // Deferred: handing off this session ends in /clear or /exit, which can't run inside this command.
+      $.clock.after(0, () => {
+        void handOffSelf($, arg === '--fresh' ? 'fresh' : 'exit')
+      })
+      return {
+        text: arg === '--fresh'
+          ? 'Writing a handoff, then clearing this session and continuing from it…'
+          : 'Writing a handoff, then exiting…',
+      }
+    }
+
     if (sub === 'handoff') {
       const row = findRow(await scan($, true), arg)
       if (!row) return { text: `No session matches "${arg}". /fleet list shows pids and names.` }
@@ -888,6 +1068,60 @@ export const register: Register = on => {
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) await update($, isOpen, () => false)
     return next(e)
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const offer = await read($, band)
+    if (!offer || e.props.hasSurvey) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const dismiss = () => { void update($, band, () => null) }
+
+    if (offer.kind === 'working') return <Text dimColor>⧉ {offer.text}</Text>
+
+    if (offer.kind === 'handedOff') {
+      return (
+        <Box flexDirection="column">
+          <Text color="green" wrap="truncate-end">⧉ Handoff written: {basename(offer.path)}</Text>
+          <Box>
+            <Button key="fresh" label="Start fresh from it" hotkey="f" variant="primary" onPress={() => startFresh($, offer.path)} />
+            <Text> </Text>
+            <Button key="keep" label="Keep going here" hotkey="k" onPress={dismiss} />
+          </Box>
+        </Box>
+      )
+    }
+
+    if (offer.kind === 'exit') {
+      return (
+        <Box flexDirection="column">
+          <Text color="yellow" wrap="truncate-end">
+            ⧉ Before you go: this session {offer.value === 'active' ? 'is still in progress' : `holds ${tokensText(offer.tokens)} tokens`}. A handoff keeps it for next time.
+          </Text>
+          <Box>
+            <Button key="handoff-exit" label="Hand off and exit" hotkey="h" variant="primary" onPress={() => { void handOffSelf($, 'exit') }} />
+            <Text> </Text>
+            <Button key="exit-now" label="Exit now" hotkey="e" onPress={() => { exitApproved = true; runLater($, 'exit') }} />
+            <Text> </Text>
+            <Button key="stay" label="Stay" hotkey="s" onPress={dismiss} />
+          </Box>
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column">
+        <Text color="yellow" wrap="truncate-end">
+          ⧉ This session is carrying {tokensText(offer.tokens)} tokens. A handoff lets a fresh session continue from about 3k.
+        </Text>
+        <Box>
+          <Button key="handoff-fresh" label="Hand off and start fresh" hotkey="h" variant="primary" onPress={() => { void handOffSelf($, 'fresh') }} />
+          <Text> </Text>
+          <Button key="handoff-only" label="Just write it" hotkey="w" onPress={() => { void handOffSelf($, null) }} />
+          <Text> </Text>
+          <Button key="later" label="Later" hotkey="l" onPress={() => { snoozedAt = offer.tokens; dismiss() }} />
+        </Box>
+      </Box>
+    )
   })
 
   on('ui.focus', async ($, e, next) => {
