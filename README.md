@@ -156,6 +156,24 @@ dependencies.
 change it. If that happens, fleet tells you in the pane, the status line and `/fleet list`, rather than
 showing an empty list. If the registry has moved, set `CLAUDE_FLEET_REGISTRY` to the new folder.
 
+## Code layout
+
+| File | What's in it |
+| --- | --- |
+| `hooks/register.tsx` | The hooks, plus everything that touches `$`: reading sessions, git, model calls, saving, closing |
+| `hooks/lib/views.tsx` | What the pane and the band draw |
+| `hooks/lib/format.ts` | Turning rows into text: the table, summaries, the status line, help |
+| `hooks/lib/rules.ts` | What counts as stale, cold, needing you, or safe to close |
+| `hooks/lib/parse.ts` | Parsing the registry, git output and transcripts |
+| `hooks/lib/prompts.ts` | What fleet asks Haiku and Sonnet, and how replies are read |
+| `hooks/lib/constants.ts`, `demo.ts` | Thresholds and timings; demo-mode data |
+| `types/index.d.ts` | Shared types and the plugin's state contract |
+
+If you contribute, there's one rule to know: **any function that uses `$` has to live in
+`register.tsx`**, because the mod validator only follows `$` within the file that registers the hooks.
+Files in `lib/` get plain data and callbacks instead, and the views get the surface's elements.
+Run `claude plugin validate .` before sending a change.
+
 ## License
 
 MIT

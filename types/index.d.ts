@@ -30,6 +30,23 @@ export type Snapshot = {
   warning: string | null
 }
 
+// One session as Claude Code's registry describes it (only the fields fleet reads).
+export type Registered = {
+  pid: number
+  name: string
+  isNamed: boolean
+  status: string
+  cwd: string
+  sessionId: string
+  updatedAt: number
+}
+
+// A generated title and resume value, cached per session with the transcript size it was made at.
+export type TitleEntry = { title: string; size: number; value?: ResumeValue }
+
+// A `/fleet kill` waiting for its confirming second run.
+export type Armed = { args: string; pids: number[]; at: number }
+
 // What the band above the prompt is offering, for this session only.
 export type Band =
   | { kind: 'context'; tokens: number }
